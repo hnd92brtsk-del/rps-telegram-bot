@@ -1,9 +1,10 @@
 import os
 import json
 import base64
-import time
 import datetime
+import time
 import asyncio
+import threading
 
 from flask import Flask, request, jsonify
 
@@ -24,7 +25,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# 1. Переменные окружения
+# 1. Environment variables
 # ============================================================
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
@@ -32,16 +33,14 @@ SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
 SERVICE_JSON_B64 = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON_B64")
 
 if not TG_BOT_TOKEN:
-    raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения")
-
+    raise RuntimeError("Missing TG_BOT_TOKEN")
 if not SPREADSHEET_NAME:
-    raise RuntimeError("Не задан SPREADSHEET_NAME в переменных окружения")
-
+    raise RuntimeError("Missing SPREADSHEET_NAME")
 if not SERVICE_JSON_B64:
-    raise RuntimeError("Не задан GSPREAD_SERVICE_ACCOUNT_JSON_B64 в переменных окружения")
+    raise RuntimeError("Missing GSPREAD_SERVICE_ACCOUNT_JSON_B64")
 
 # ============================================================
-# 2. Инициализация Google Sheets
+# 2. Google Sheets setup
 # ============================================================
 
 sa_info = json.loads(base64.b64decode(SERVICE_JSON_B64).decode("utf-8"))
@@ -54,8 +53,7 @@ gc = gspread.authorize(credentials)
 sh = gc.open(SPREADSHEET_NAME)
 
 
-def get_or_create_worksheet(name: str, headers: list):
-    """Получаем лист по имени, если нет — создаём и ставим заголовки."""
+def get_or_create_worksheet(name, headers):
     try:
         ws = sh.worksheet(name)
     except WorksheetNotFound:
@@ -63,368 +61,245 @@ def get_or_create_worksheet(name: str, headers: list):
         ws.append_row(headers)
         return ws
 
-    # если первая строка пустая — добавим заголовки
-    first_row = ws.row_values(1)
-    if not first_row:
+    first = ws.row_values(1)
+    if not first:
         ws.append_row(headers)
     return ws
 
 
-users_sheet = get_or_create_worksheet(
-    "users",
-    ["user_id", "name", "reg_date"],
-)
+users_sheet = get_or_create_worksheet("users",
+    ["user_id", "name", "reg_date"])
 
-mode_votes_sheet = get_or_create_worksheet(
-    "mode_votes",
-    ["date", "user_id", "mode"],
-)
+mode_votes_sheet = get_or_create_worksheet("mode_votes",
+    ["date", "user_id", "mode"])
 
-games_sheet = get_or_create_worksheet(
-    "games",
-    ["game_id", "date", "mode", "winner", "moves_count", "finished"],
-)
+games_sheet = get_or_create_worksheet("games",
+    ["game_id", "date", "mode", "winner", "moves_count", "finished"])
 
-moves_sheet = get_or_create_worksheet(
-    "moves",
-    [
-        "game_id",
-        "move_no",
-        "player1_id",
-        "player1_move",
-        "player2_id",
-        "player2_move",
-        "winner_for_move",
-        "timestamp",
-    ],
-)
+moves_sheet = get_or_create_worksheet("moves",
+    ["game_id", "move_no", "player1_id", "player1_move",
+     "player2_id", "player2_move", "winner_for_move", "timestamp"])
 
-# ============================================================
-# 3. Вспомогательные функции для работы с таблицами
-# ============================================================
 
-def today_str() -> str:
+def today():
     return datetime.date.today().isoformat()
 
 
-def find_user(telegram_id: int):
-    """Ищем пользователя в листе users. Возвращаем dict или None."""
-    records = users_sheet.get_all_records()
-    for r in records:
-        if str(r.get("user_id")) == str(telegram_id):
+def find_user(tg_id):
+    for r in users_sheet.get_all_records():
+        if str(r["user_id"]) == str(tg_id):
             return r
     return None
 
 
-def register_user(telegram_id: int, name: str):
-    """Регистрируем пользователя, если его ещё нет."""
-    existing = find_user(telegram_id)
-    if existing:
+def register_user(tg_id, name):
+    if find_user(tg_id):
         return False
-    users_sheet.append_row([str(telegram_id), name, today_str()])
+    users_sheet.append_row([str(tg_id), name, today()])
     return True
 
 
-def record_mode_vote(user_id: int, mode: str):
-    """
-    Записываем голос за режим (manual/auto) на сегодня.
-    Возвращаем:
-        ('waiting', None)       — ждём второго игрока / разные режимы
-        ('started', game_id)    — оба выбрали одно и то же, игра создана
-        ('already', game_id)    — игра на сегодня уже есть
-    """
-    date = today_str()
+def get_today_game():
+    for idx, r in enumerate(games_sheet.get_all_records(), start=2):
+        if r["date"] == today():
+            return idx, r
+    return None, None
+
+
+def create_new_game(mode):
+    gid = f"{today()}_{int(time.time())}"
+    games_sheet.append_row([gid, today(), mode, "", 0, "FALSE"])
+    return gid
+
+
+def record_mode_vote(tg_id, mode):
+    date = today()
     records = mode_votes_sheet.get_all_records()
 
-    # обновим/добавим голос этого пользователя
     updated = False
-    for idx, r in enumerate(records, start=2):
-        if r.get("date") == date and str(r.get("user_id")) == str(user_id):
-            mode_votes_sheet.update_cell(idx, 3, mode)
+    for i, r in enumerate(records, start=2):
+        if r["date"] == date and str(r["user_id"]) == str(tg_id):
+            mode_votes_sheet.update_cell(i, 3, mode)
             updated = True
             break
 
     if not updated:
-        mode_votes_sheet.append_row([date, str(user_id), mode])
+        mode_votes_sheet.append_row([date, str(tg_id), mode])
 
-    # проверяем, есть ли уже игра на сегодня
-    g_row, g = get_today_game()
+    # already game?
+    i, g = get_today_game()
     if g:
-        return "already", g.get("game_id")
+        return "already", g["game_id"]
 
-    # теперь читаем все голоса за сегодня
-    records = mode_votes_sheet.get_all_records()
-    votes_today = [r for r in records if r.get("date") == date]
+    # check 2 players same mode
+    votes = mode_votes_sheet.get_all_records()
+    same = {}
+    for v in votes:
+        if v["date"] != date:
+            continue
+        same.setdefault(v["mode"], set()).add(str(v["user_id"]))
 
-    # нам нужны два разных user_id с одинаковым mode
-    modes = {}
-    for r in votes_today:
-        uid = str(r.get("user_id"))
-        m = r.get("mode")
-        modes.setdefault(m, set()).add(uid)
-
-    for m, users_set in modes.items():
-        if len(users_set) >= 2:
-            # оба выбрали одинаковый режим — создаём игру
+    for m, us in same.items():
+        if len(us) >= 2:
             gid = create_new_game(m)
             return "started", gid
 
     return "waiting", None
 
 
-def get_today_game():
-    """Возвращаем (row_index, game_dict) для сегодняшней игры или (None, None)."""
-    date = today_str()
-    records = games_sheet.get_all_records()
-    for idx, r in enumerate(records, start=2):
-        if r.get("date") == date:
-            return idx, r
-    return None, None
-
-
-def create_new_game(mode: str) -> str:
-    """Создаём новую игру на сегодня (если её ещё нет)."""
-    now = int(time.time())
-    gid = f"{today_str()}_{now}"
-    games_sheet.append_row([gid, today_str(), mode, "", 0, "FALSE"])
-    return gid
-
-
-def get_moves_for_game(game_id: str):
-    records = moves_sheet.get_all_records()
-    return [r for r in records if r.get("game_id") == game_id]
-
-
-def save_auto_choice(game_id: str, user_id: int, move: str):
-    """
-    Сохраняем выбор в авто-режиме.
-    Записываем как winner_for_move='auto_choice', move_no=0.
-    """
-    # удалим старые auto_choice этого пользователя для этой игры (если были)
-    records = moves_sheet.get_all_records()
-    for idx, r in enumerate(records, start=2):
-        if (
-            r.get("game_id") == game_id
-            and r.get("winner_for_move") == "auto_choice"
-            and str(r.get("player1_id")) == str(user_id)
-        ):
-            moves_sheet.delete_rows(idx)
-
-    # добавим новую запись
-    moves_sheet.append_row(
-        [
-            game_id,
-            0,
-            str(user_id),
-            move,
-            "",
-            "",
-            "auto_choice",
-            datetime.datetime.now().isoformat(),
-        ]
-    )
-
-
-def determine_winner(move1: str, move2: str) -> str:
-    """
-    Определяем победителя между 'rock', 'paper', 'scissors'.
-    Возвращаем 'tie', 'player1' или 'player2'.
-    """
+def determine_winner(a, b):
     beats = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
-    if move1 == move2:
+    if a == b:
         return "tie"
-    if beats[move1] == move2:
-        return "player1"
-    return "player2"
+    return "player1" if beats[a] == b else "player2"
 
 
-def process_daily_auto_game():
-    """
-    Вызывается раз в день (cron /daily_check).
-    Обрабатывает авто-игру:
-      - если два игрока сделали выбор → считаем результат
-      - записываем в games и moves
-      - отправляем сообщение игрокам
-    """
-    row, game = get_today_game()
-    if not game:
-        return {"status": "no_game_today"}
+def save_auto_choice(game_id, tg_id, move):
+    rows = moves_sheet.get_all_records()
 
-    if game.get("mode") != "auto":
-        return {"status": "mode_not_auto"}
+    # delete old auto choice
+    to_delete = []
+    for idx, r in enumerate(rows, start=2):
+        if (
+            r["game_id"] == game_id
+            and r["winner_for_move"] == "auto_choice"
+            and str(r["player1_id"]) == str(tg_id)
+        ):
+            to_delete.append(idx)
 
-    if str(game.get("finished")).upper() == "TRUE":
-        return {"status": "already_finished"}
+    for d in reversed(to_delete):
+        moves_sheet.delete_rows(d)
 
-    gid = game.get("game_id")
+    moves_sheet.append_row([
+        game_id, 0, str(tg_id), move, "", "", "auto_choice",
+        datetime.datetime.now().isoformat()
+    ])
+
+
+def daily_auto():
+    idx, g = get_today_game()
+    if not g:
+        return {"status": "no_game"}
+
+    if g["mode"] != "auto":
+        return {"status": "not_auto"}
+    if str(g["finished"]).upper() == "TRUE":
+        return {"status": "already"}
+
+    gid = g["game_id"]
+    rows = moves_sheet.get_all_records()
+
+    choices = {}
+    for r in rows:
+        if r["game_id"] == gid and r["winner_for_move"] == "auto_choice":
+            choices[str(r["player1_id"])] = r
+
+    if len(choices) < 2:
+        return {"status": "not_enough"}
+
+    ids = list(choices.keys())[:2]
+    c1 = choices[ids[0]]
+    c2 = choices[ids[1]]
+
+    w = determine_winner(c1["player1_move"], c2["player1_move"])
+
+    # get move_no
     all_moves = moves_sheet.get_all_records()
-    choices = [
-        r
-        for r in all_moves
-        if r.get("game_id") == gid and r.get("winner_for_move") == "auto_choice"
-    ]
+    move_no = sum(1 for r in all_moves if r["game_id"] == gid and r["winner_for_move"] in ("player1","player2","tie")) + 1
 
-    # берём последние выборы двух разных пользователей
-    by_user = {}
-    for r in choices:
-        by_user[str(r.get("player1_id"))] = r
+    moves_sheet.append_row([
+        gid, move_no,
+        c1["player1_id"], c1["player1_move"],
+        c2["player1_id"], c2["player1_move"],
+        w, datetime.datetime.now().isoformat()
+    ])
 
-    if len(by_user) < 2:
-        return {"status": "not_enough_players"}
+    if w == "tie":
+        games_sheet.update_cell(idx, 5, move_no)
+        games_sheet.update_cell(idx, 4, "draw_pending")
+        return {"status": "tie"}
 
-    # берём первые два
-    users_list = list(by_user.keys())[:2]
-    r1 = by_user[users_list[0]]
-    r2 = by_user[users_list[1]]
-
-    move1 = r1.get("player1_move")
-    move2 = r2.get("player1_move")
-    winner = determine_winner(move1, move2)
-
-    # считаем номер хода
-    existing_moves = get_moves_for_game(gid)
-    move_no = sum(1 for m in existing_moves if m.get("winner_for_move") in ("player1", "player2", "tie")) + 1
-
-    # записываем ход
-    moves_sheet.append_row(
-        [
-            gid,
-            move_no,
-            r1.get("player1_id"),
-            move1,
-            r2.get("player1_id"),
-            move2,
-            winner,
-            datetime.datetime.now().isoformat(),
-        ]
-    )
-
-    # обновляем games
-    if winner == "tie":
-        games_sheet.update_cell(row, 5, move_no)          # moves_count
-        games_sheet.update_cell(row, 4, "draw_pending")   # winner
-        # игру не завершаем
-        return {"status": "tie", "move_no": move_no}
-
-    # определяем имя победителя по users
-    winner_id = r1.get("player1_id") if winner == "player1" else r2.get("player1_id")
+    winner_id = c1["player1_id"] if w == "player1" else c2["player1_id"]
     users = users_sheet.get_all_records()
-    winner_name = "Unknown"
-    for u in users:
-        if str(u.get("user_id")) == str(winner_id):
-            winner_name = u.get("name") or "Unknown"
-            break
+    winner_name = next((u["name"] for u in users if str(u["user_id"]) == str(winner_id)), "Winner")
 
-    # обновим игру как завершённую
-    games_sheet.update_row(row, [gid, today_str(), "auto", winner_name, move_no, "TRUE"])
+    games_sheet.update_row(idx, [
+        gid, today(), "auto", winner_name, move_no, "TRUE"
+    ])
 
-    # уведомим игроков через бота
-    try:
-        application.bot.send_message(
-            chat_id=int(r1.get("player1_id")),
-            text=f"Игра {today_str()} (auto). Победитель: {winner_name}. Ходов: {move_no}",
-        )
-    except Exception:
-        pass
+    return {"status": "finished", "winner": winner_name}
 
-    try:
-        application.bot.send_message(
-            chat_id=int(r2.get("player1_id")),
-            text=f"Игра {today_str()} (auto). Победитель: {winner_name}. Ходов: {move_no}",
-        )
-    except Exception:
-        pass
-
-    return {"status": "finished", "winner": winner_name, "move_no": move_no}
 
 # ============================================================
-# 4. Telegram bot: обработчики
+# Telegram bot setup (NO event loop closing!)
 # ============================================================
 
 application = Application.builder().token(TG_BOT_TOKEN).build()
 
+# --- Handlers ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — показываем главное меню."""
     user = update.effective_user
-    tg_id = user.id
+    u = find_user(user.id)
 
-    user_record = find_user(tg_id)
-    if user_record:
-        hello = f"Привет, {user_record.get('name')}!"
-    else:
-        hello = "Привет! Ты ещё не зарегистрирован."
+    hello = f"Привет, {u['name']}!" if u else "Привет! Ты не зарегистрирован."
 
-    keyboard = [
+    kb = [
         [
-            InlineKeyboardButton("Я — Руся", callback_data="reg_Rusya"),
-            InlineKeyboardButton("Я — Никита", callback_data="reg_Nikita"),
+            InlineKeyboardButton("Я — Руся", callback_data="reg_rusya"),
+            InlineKeyboardButton("Я — Никита", callback_data="reg_nikita")
         ],
-        [InlineKeyboardButton("Выбрать режим (manual/auto)", callback_data="choose_mode")],
+        [InlineKeyboardButton("Выбрать режим", callback_data="choose_mode")],
         [InlineKeyboardButton("Сделать ход (auto)", callback_data="auto_move")],
-        [InlineKeyboardButton("Показать статистику", callback_data="show_stats")],
+        [InlineKeyboardButton("Статистика", callback_data="stats")],
     ]
-    await update.message.reply_text(hello, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    await update.message.reply_text(hello, reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка всех нажатий на кнопки."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
-    tg_id = user.id
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
 
-    # --- регистрация ---
-    if data.startswith("reg_"):
-        name = "Руся" if data == "reg_Rusya" else "Никита"
-        ok = register_user(tg_id, name)
-        if ok:
-            await query.edit_message_text(f"Ты зарегистрирован как {name}.")
-        else:
-            await query.edit_message_text(f"Ты уже зарегистрирован.")
+    uid = q.from_user.id
+    data = q.data
+
+    # Registration
+    if data == "reg_rusya":
+        ok = register_user(uid, "Руся")
+        await q.edit_message_text("Регистрация выполнена." if ok else "Уже зарегистрирован.")
         return
 
-    # --- выбор режима ---
+    if data == "reg_nikita":
+        ok = register_user(uid, "Никита")
+        await q.edit_message_text("Регистрация выполнена." if ok else "Уже зарегистрирован.")
+        return
+
+    # Choose mode
     if data == "choose_mode":
         kb = [
-            [InlineKeyboardButton("Ручной (manual)", callback_data="mode_manual")],
-            [InlineKeyboardButton("Автоматический (auto)", callback_data="mode_auto")],
+            [InlineKeyboardButton("manual", callback_data="mode_manual")],
+            [InlineKeyboardButton("auto", callback_data="mode_auto")],
         ]
-        await query.edit_message_text(
-            "Выбери режим на сегодня.\n"
-            "Режим будет установлен, когда оба игрока выберут одинаково.",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        await q.edit_message_text("Выбери режим:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data in ("mode_manual", "mode_auto"):
         mode = "manual" if data == "mode_manual" else "auto"
-        status, gid = record_mode_vote(tg_id, mode)
-
+        status, gid = record_mode_vote(uid, mode)
         if status == "waiting":
-            await query.edit_message_text(
-                f"Твой выбор: {mode}. Ожидаем выбор второго игрока."
-            )
-        elif status == "already":
-            await query.edit_message_text(
-                f"Игра на сегодня уже существует (режим {mode})."
-            )
+            await q.edit_message_text(f"Твой выбор: {mode}. Ждём второго игрока.")
         elif status == "started":
-            await query.edit_message_text(
-                f"Отлично! Оба игрока выбрали {mode}. Игра на сегодня создана."
-            )
+            await q.edit_message_text(f"Игра создана ({mode}).")
+        else:
+            await q.edit_message_text("Игра уже есть.")
         return
 
-    # --- авто-ход ---
+    # Auto-move choose
     if data == "auto_move":
-        # проверим, есть ли сегодня игра в авто-режиме
         row, g = get_today_game()
-        if not g or g.get("mode") != "auto":
-            await query.edit_message_text(
-                "На сегодня ещё не создана авто-игра. "
-                "Сначала оба игрока должны выбрать режим 'Автоматический'."
-            )
+        if not g or g["mode"] != "auto":
+            await q.edit_message_text("Авто-игра ещё не создана.")
             return
 
         kb = [
@@ -434,106 +309,71 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("Бумага", callback_data="auto_paper"),
             ]
         ]
-        await query.edit_message_text(
-            "Выбери свой ход (он будет скрыт до расчёта результата).",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        await q.edit_message_text("Выбери ход:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("auto_"):
-        move_map = {
-            "auto_rock": "rock",
-            "auto_scissors": "scissors",
-            "auto_paper": "paper",
-        }
-        move = move_map[data]
-
+        move = data.split("_")[1]
         row, g = get_today_game()
-        if not g or g.get("mode") != "auto":
-            await query.edit_message_text(
-                "Авто-игра на сегодня ещё не создана. "
-                "Сначала оба игрока выбирают авто-режим."
-            )
+        if not g or g["mode"] != "auto":
+            await q.edit_message_text("Авто-игра не создана.")
             return
 
-        gid = g.get("game_id")
-        save_auto_choice(gid, tg_id, move)
-        await query.edit_message_text(
-            f"Твой ход ({move}) сохранён.\n"
-            f"Когда оба игрока сделают ход, а также при ежедневной проверке в 11:00, "
-            f"бот посчитает результат."
-        )
+        save_auto_choice(g["game_id"], uid, move)
+        await q.edit_message_text(f"Ход сохранён ({move}).")
         return
 
-    # --- статистика ---
-    if data == "show_stats":
-        records = games_sheet.get_all_records()
-        total = len(records)
-        finished = sum(
-            1 for r in records if str(r.get("finished")).upper() == "TRUE"
-        )
-        auto_games = sum(1 for r in records if r.get("mode") == "auto")
-        manual_games = sum(1 for r in records if r.get("mode") == "manual")
-
-        text = (
-            f"Общая статистика:\n"
-            f"Всего партий: {total}\n"
-            f"Завершённых: {finished}\n"
-            f"Авто-игр: {auto_games}\n"
-            f"Ручных игр: {manual_games}\n"
-            f"(Детализированную статистику можно будет добавить позже.)"
-        )
-        await query.edit_message_text(text)
+    if data == "stats":
+        games = games_sheet.get_all_records()
+        total = len(games)
+        finished = sum(1 for g in games if str(g["finished"]).upper() == "TRUE")
+        await q.edit_message_text(f"Всего игр: {total}\nЗавершено: {finished}")
         return
 
 
-# Регистрация обработчиков
 application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CallbackQueryHandler(on_callback))
+application.add_handler(CallbackQueryHandler(cb))
 
 # ============================================================
-# 5. Запуск Telegram Application (initialize + start)
+# Create ONE GLOBAL EVENT LOOP forever
 # ============================================================
 
 loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-loop.run_until_complete(application.initialize())
-loop.run_until_complete(application.start())
-print("Telegram Application initialized and started.")
+
+
+def run_bot():
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.initialize())
+    loop.run_until_complete(application.start())
+    loop.run_forever()
+
+
+threading.Thread(target=run_bot, daemon=True).start()
 
 # ============================================================
-# 6. Flask-приложение и webhook
+# Flask server
 # ============================================================
 
 app = Flask(__name__)
-WEBHOOK_PATH = "/webhook"
 
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
-    return "RPS bot is running."
+    return "Bot running"
 
 
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def telegram_webhook():
-    """Приём апдейтов от Telegram (Webhook)."""
+@app.route("/webhook", methods=["POST"])
+def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run(application.process_update(update))
-    return "OK"
+    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+    return "ok"
 
 
-@app.route("/daily_check", methods=["GET", "POST"])
+@app.route("/daily_check")
 def daily_check():
-    """Эндпоинт, который будет вызывать cron-job.org каждый день в 11:00."""
-    result = process_daily_auto_game()
-    return jsonify(result)
+    return jsonify(daily_auto())
 
-
-# ============================================================
-# 7. Запуск Flask (для Render)
-# ============================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    print(f"Запуск Flask на порту {port}")
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
