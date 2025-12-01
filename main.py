@@ -291,11 +291,15 @@ def process_daily_checks():
 # Flask routes: Telegram webhook and daily_check
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-    # Telegram присылает update -> передаём в application
     update = Update.de_json(request.get_json(force=True), telegram_bot)
-    # обработаем синхронно - используем loop
+
+    # Создаём новый event loop специально для обработки обновления
     import asyncio
-    asyncio.get_event_loop().create_task(application.process_update(update))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.process_update(update))
+    loop.close()
+
     return "OK"
 
 @app.route("/daily_check", methods=["POST","GET"])
